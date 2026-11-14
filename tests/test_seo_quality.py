@@ -95,7 +95,10 @@ class SeoQualityTests(unittest.TestCase):
         highlights = [{"title": "Hook", "hook_sentence": "A joke",
                        "start_time": 0, "end_time": 10,
                        "transcript_text": "Maine kaha yeh kya hua", "scene": {"genre": "standup"}}]
-        out = seo.generate_seo(highlights, subject={}, llm_fn=fake_llm)
+        # Test the cloud prompt explicitly, regardless of the selected Ollama setting.
+        # The LLM response is mocked: this does NOT call Gemini or spend API quota.
+        with patch("shorts_generator.config.current_provider", return_value="gemini"):
+            out = seo.generate_seo(highlights, subject={}, llm_fn=fake_llm)
         self.assertEqual(len(out), 1)
         self.assertTrue(out[0]['generated'])
         self.assertIn('Samay Ka Yeh Joke', out[0]['title'])
