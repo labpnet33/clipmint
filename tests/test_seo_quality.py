@@ -78,6 +78,8 @@ class SeoQualityTests(unittest.TestCase):
         excluded = gen.call_args.kwargs['avoid_titles']
         self.assertIn('My Previous Title', excluded)
         self.assertIn('Other Clip Title', excluded)
+        from shorts_generator.local.task_routing import call_seo_llm
+        self.assertEqual((gen.call_args.kwargs['llm_fn'].__module__, gen.call_args.kwargs['llm_fn'].__qualname__), (call_seo_llm.__module__, call_seo_llm.__qualname__))
 
     @patch.object(seo.playbook, 'prompt_text', return_value='playbook')
     @patch.object(seo.playbook, 'load', return_value=('playbook', 'local'))
@@ -97,7 +99,8 @@ class SeoQualityTests(unittest.TestCase):
                        "transcript_text": "Maine kaha yeh kya hua", "scene": {"genre": "standup"}}]
         # Test the cloud prompt explicitly, regardless of the selected Ollama setting.
         # The LLM response is mocked: this does NOT call Gemini or spend API quota.
-        with patch("shorts_generator.config.current_provider", return_value="gemini"):
+        with patch("shorts_generator.config.current_provider", return_value="gemini"), \
+             patch("shorts_generator.config.current_stage_provider", return_value="gemini"):
             out = seo.generate_seo(highlights, subject={}, llm_fn=fake_llm)
         self.assertEqual(len(out), 1)
         self.assertTrue(out[0]['generated'])

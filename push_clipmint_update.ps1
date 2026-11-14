@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$expectedBranch = "feature/ollama-startup-integration"
+$expectedBranch = "feature/viral-moment-detection"
 $expectedRemote = "fork"
 $allowedRemoteUrls = @(
     "https://github.com/labpnet33/clipmint.git",
@@ -20,13 +20,25 @@ $files = @(
     "shorts_generator/user_config.py",
     "shorts_generator/local/llm.py",
     "shorts_generator/local/ollama_api.py",
+    "shorts_generator/local/ai_activity.py",
+    "shorts_generator/local/gpu_handoff.py",
+    "shorts_generator/local/transcriber.py",
+    "shorts_generator/local/task_routing.py",
     "shorts_generator/seo.py",
+    "shorts_generator/boundaries.py",
+    "shorts_generator/signals.py",
+    "shorts_generator/viral_moments.py",
     "webapp/server.py",
     "webapp/jobs.py",
     "webapp/static/index.html",
+    "webapp/static/style.css",
     "webapp/static/app.js",
     "tests/test_ollama_integration.py",
+    "tests/test_ai_activity.py",
+    "tests/test_gpu_handoff.py",
+    "tests/test_task_providers.py",
     "tests/test_seo_quality.py",
+    "tests/test_viral_moments.py",
     "push_clipmint_update.ps1"
 )
 
@@ -71,7 +83,7 @@ try {
     }
 
     Write-Host "`nRunning local regression tests ..." -ForegroundColor Yellow
-    $testPatterns = @("test_ollama_integration.py", "test_seo_quality.py")
+    $testPatterns = @("test_ollama_integration.py", "test_seo_quality.py", "test_task_providers.py", "test_gpu_handoff.py", "test_ai_activity.py", "test_viral_moments.py")
     foreach ($pattern in $testPatterns) {
         if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot "tests\$pattern"))) {
             throw "Required test is missing: tests\$pattern. No push attempted."

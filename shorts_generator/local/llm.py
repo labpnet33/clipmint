@@ -91,7 +91,11 @@ class DailyQuotaExceeded(RuntimeError):
     """The provider's per-day allowance is gone. Waiting will not help."""
 
 
-def call_openai_llm(prompt: str) -> str:
+from . import ai_activity  # ClipMint AI Activity Dashboard v1
+
+
+@ai_activity.trace_provider("openai")
+def call_openai_llm(prompt: str, model_override: Optional[str] = None) -> str:
     """OpenAI Chat Completions backend used by --mode local."""
     try:
         from openai import OpenAI  # type: ignore
@@ -101,7 +105,7 @@ def call_openai_llm(prompt: str) -> str:
             "    pip install -r requirements-local.txt"
         ) from e
 
-    model = current_model("openai")
+    model = model_override or current_model("openai")
     client = OpenAI(api_key=require_openai_key())
     response = client.chat.completions.create(
         model=model,
@@ -115,7 +119,8 @@ def call_openai_llm(prompt: str) -> str:
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
-def call_groq_llm(prompt: str) -> str:
+@ai_activity.trace_provider("groq")
+def call_groq_llm(prompt: str, model_override: Optional[str] = None) -> str:
     """Groq backend: open-weight models on Groq's own hardware, free tier.
 
     Groq speaks the OpenAI Chat Completions API, so this reuses the `openai`
@@ -141,7 +146,7 @@ def call_groq_llm(prompt: str) -> str:
             "Install it with:\n    pip install -r requirements-local.txt"
         ) from e
 
-    model = current_model("groq")
+    model = model_override or current_model("groq")
     client = OpenAI(api_key=require_groq_key(), base_url=GROQ_BASE_URL)
     response = client.chat.completions.create(
         model=model,
@@ -166,7 +171,8 @@ def _openrouter_client():
                   default_headers=_OPENROUTER_HEADERS)
 
 
-def call_openrouter_llm(prompt: str) -> str:
+@ai_activity.trace_provider("openrouter")
+def call_openrouter_llm(prompt: str, model_override: Optional[str] = None) -> str:
     """OpenRouter backend: one key in front of models from every lab.
 
     Same Chat Completions API as OpenAI and Groq, so the same client. No
@@ -182,7 +188,7 @@ def call_openrouter_llm(prompt: str) -> str:
             "Install it with:\n    pip install -r requirements-local.txt"
         ) from e
 
-    model = current_model("openrouter")
+    model = model_override or current_model("openrouter")
     response = _openrouter_client().chat.completions.create(
         model=model,
         temperature=0.2,
@@ -208,7 +214,9 @@ def _is_daily_quota(msg: str) -> bool:
     return "perday" in lowered.replace("_", "") or "per day" in lowered
 
 
-def call_gemini_llm(prompt: str, contents: Optional[list] = None) -> str:
+@ai_activity.trace_provider("gemini")
+def call_gemini_llm(prompt: str, contents: Optional[list] = None,
+                    model_override: Optional[str] = None) -> str:
     """Gemini backend used by --mode local when LLM_PROVIDER=gemini.
 
     `contents`, when given, is sent instead of `prompt` -- a list of text and
@@ -222,7 +230,7 @@ def call_gemini_llm(prompt: str, contents: Optional[list] = None) -> str:
             "    pip install -r requirements-local.txt"
         ) from e
 
-    model = current_model("gemini")
+    model = model_override or current_model("gemini")
     keys = gemini_keys() or [require_gemini_key()]
     while True:
         index = _first_live_key(keys, model)
@@ -440,14 +448,16 @@ def _as_openai_content(parts: list) -> list:
     return out
 
 
-def _openai_compatible_vision(parts: list, provider: str) -> str:
+@ai_activity.trace_provider(lambda parts, provider, **kw: provider, kind="vision")
+def _openai_compatible_vision(parts: list, provider: str,
+                              model_override: Optional[str] = None) -> str:
     from openai import OpenAI  # type: ignore
     if provider == "groq":
-        client, model = OpenAI(api_key=require_groq_key(), base_url=GROQ_BASE_URL), GROQ_VISION_MODEL
+        client, model = OpenAI(api_key=require_groq_key(), base_url=GROQ_BASE_URL), (model_override or GROQ_VISION_MODEL)
     elif provider == "openrouter":
-        client, model = _openrouter_client(), current_model("openrouter")
+        client, model = _openrouter_client(), (model_override or current_model("openrouter"))
     else:
-        client, model = OpenAI(api_key=require_openai_key()), current_model("openai")
+        client, model = OpenAI(api_key=require_openai_key()), (model_override or current_model("openai"))
     response = client.chat.completions.create(
         model=model,
         temperature=0.1,

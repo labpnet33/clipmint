@@ -30,6 +30,7 @@ signals still work, the weights redistribute again, and the run continues. A
 ranking aid must never be able to sink a render.
 """
 from __future__ import annotations
+from .viral_moments import score_moment_integrity  # CLIPMINT_VIRAL_V1
 
 
 import re
@@ -471,6 +472,11 @@ def rescore(highlights: List[Dict], transcript: Optional[Dict],
             blended *= 1.0 - dark
             h["visual_penalty"] = dark
 
+        # Small, evidence-based correction; never overrides the existing
+        # model/audio/chat ranking or guesses from missing transcripts.
+        integrity = score_moment_integrity(h, transcript)
+        h["moment_integrity"] = integrity
+        blended += integrity["adjustment"]
         h["model_score"] = model_score
         h["score"] = int(round(max(0.0, min(100.0, blended))))
     return highlights

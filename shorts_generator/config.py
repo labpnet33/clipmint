@@ -115,6 +115,40 @@ def current_provider() -> str:
     return (user_config.get("LLM_PROVIDER", LLM_PROVIDER) or "gemini").strip().lower()
 
 
+# ClipMint task-specific AI providers v1
+STAGE_PROVIDER_KEYS = {"highlight": "HIGHLIGHT_PROVIDER", "vision": "VISION_PROVIDER",
+                       "seo": "SEO_PROVIDER"}
+
+
+def current_stage_provider(stage: str) -> str:
+    """Stage choice; legacy LLM_PROVIDER is used until a stage is configured."""
+    from . import user_config
+    if stage not in STAGE_PROVIDER_KEYS:
+        raise ValueError(f"Unknown AI stage: {stage}")
+    saved = user_config.get(STAGE_PROVIDER_KEYS[stage], "").strip().lower()
+    if saved:
+        return saved
+    legacy = current_provider()
+    return "off" if stage == "vision" and legacy == "ollama" else legacy
+
+
+def current_stage_model(stage: str) -> str:
+    """Optional stage-specific model, otherwise the provider's existing model."""
+    from . import user_config
+    provider = current_stage_provider(stage)
+    if provider == "off":
+        return ""
+    selected = user_config.get(stage.upper() + "_MODEL", "").strip()
+    if selected:
+        return selected
+    if stage == "vision" and provider == "groq":
+        # Groq text-model defaults are not vision-capable.
+        from .local.llm import GROQ_VISION_MODEL
+        return GROQ_VISION_MODEL
+    return current_model(provider)
+
+
+
 def current_processor() -> str:
     """auto / gpu / cpu -- what does the heavy work. See accel.py.
 

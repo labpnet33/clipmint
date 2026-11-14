@@ -303,6 +303,86 @@ async def get_settings() -> dict:
     }
 
 
+# ClipMint task-specific AI providers v1
+AI_STAGE_ALLOWED = {
+    "highlight": ("ollama", "gemini", "groq", "openrouter", "openai"),
+    "vision": ("off", "gemini", "groq", "openrouter", "openai"),
+    "seo": ("ollama", "gemini", "groq", "openrouter", "openai"),
+}
+
+
+class TaskProvidersRequest(BaseModel):
+    highlight_provider: str
+    vision_provider: str
+    seo_provider: str
+    highlight_model: str = ""
+    vision_model: str = ""
+    seo_model: str = ""
+
+
+@app.get("/api/ai/tasks")
+async def get_task_ai_settings() -> dict:
+    from shorts_generator import user_config
+    from shorts_generator.config import current_stage_model, current_stage_provider
+    from shorts_generator.local.task_routing import readiness
+
+    stages = {}
+    for stage in AI_STAGE_ALLOWED:
+        provider = current_stage_provider(stage)
+        stages[stage] = {
+            "provider": provider,
+            "model": current_stage_model(stage),
+            "model_override": user_config.get(stage.upper() + "_MODEL", ""),
+            "provider_pinned": bool(os.getenv(stage.upper() + "_PROVIDER", "").strip()),
+            "model_pinned": bool(os.getenv(stage.upper() + "_MODEL", "").strip()),
+            "health": await asyncio.to_thread(readiness, stage),
+        }
+    return {"stages": stages}
+
+
+@app.post("/api/ai/tasks")
+async def save_task_ai_settings(req: TaskProvidersRequest) -> dict:
+    """Validate ALL tasks before one atomic settings save; no cloud API calls."""
+    from shorts_generator import user_config
+    from shorts_generator.config import current_model
+    from shorts_generator.local.ollama_api import status as ollama_status
+
+    values = {}
+    selection = {"highlight": req.highlight_provider, "vision": req.vision_provider,
+                 "seo": req.seo_provider}
+    models = {"highlight": req.highlight_model, "vision": req.vision_model,
+              "seo": req.seo_model}
+    key_names = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY",
+                 "openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY"}
+    for stage, raw_provider in selection.items():
+        provider = (raw_provider or "").strip().lower()
+        if provider not in AI_STAGE_ALLOWED[stage]:
+            raise HTTPException(400, f"Unsupported {stage} AI provider: {provider}")
+        if os.getenv(stage.upper() + "_PROVIDER", "").strip():
+            raise HTTPException(409, f"{stage.upper()}_PROVIDER is pinned in the environment")
+        if os.getenv(stage.upper() + "_MODEL", "").strip():
+            raise HTTPException(409, f"{stage.upper()}_MODEL is pinned in the environment")
+        model = (models[stage] or "").strip()
+        if len(model) > 160 or any(c in model for c in "\r\n\x00"):
+            raise HTTPException(400, f"Invalid {stage} model name")
+        if provider in key_names and not user_config.get(key_names[provider]):
+            raise HTTPException(409, f"{provider} needs an API key in Settings")
+        if stage == "vision" and provider == "openrouter" and not model:
+            raise HTTPException(400, "Enter a vision-capable OpenRouter model ID for Vision AI")
+        if provider == "ollama":
+            effective = model or current_model("ollama")
+            # The installed list is checked for the actual stage's model.
+            state = await asyncio.to_thread(ollama_status, 2, effective)
+            if not state["running"]:
+                raise HTTPException(409, "Ollama not running. Open Ollama and retry.")
+            if not state["model_installed"]:
+                raise HTTPException(409, f"Ollama model {effective} missing. Run: ollama pull {effective}")
+        values[stage.upper() + "_PROVIDER"] = provider
+        values[stage.upper() + "_MODEL"] = model
+    path = user_config.save(values)
+    return {"saved": True, "config_path": str(path)}
+
+
 @app.get("/api/usage")
 async def get_usage() -> dict:
     """Today's API spend, so the daily cap is visible before it bites."""
@@ -315,6 +395,7 @@ async def get_usage() -> dict:
     provider = current_provider()
     snap["provider"] = provider
     snap["model"] = current_model(provider)
+    snap["task_routing"] = True  # GUI text must not promise legacy automatic fallback
     # Whether a spent Gemini day would actually be survivable, and on what:
     # the first configured provider in the order the fallback ladder tries.
     fallback = next((name for name, key in (
@@ -1498,9 +1579,12 @@ async def write_seo(job_id: str, force: bool = False, only: Optional[str] = None
         only = os.path.basename(only)
         if STORE.clip(job, only) is None:
             raise HTTPException(404, "No such clip")
+    from shorts_generator.local import ai_activity  # ClipMint AI Activity Dashboard v1
     try:
-        written = await asyncio.to_thread(regenerate_seo, STORE, job, force or bool(only),
-                                          only)
+        with ai_activity.watch(job.id, lambda event: STORE._record_ai(job, event)):
+            written = await asyncio.to_thread(regenerate_seo, STORE, job, force or bool(only),
+                                              only)
+        STORE._persist(job)  # include the activity from Rewrite Titles
     except Exception as e:
         raise HTTPException(500, f"Could not write the metadata: {e}")
     return {"written": written, "clips": job.clips}

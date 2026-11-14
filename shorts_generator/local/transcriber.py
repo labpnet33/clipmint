@@ -3,6 +3,7 @@
 Reads a local media file and returns the same shape the highlight generator
 expects: {duration, segments[start, end, text]}.
 """
+import gc
 import os
 import re
 import time
@@ -12,26 +13,30 @@ from typing import Dict, List, Optional
 import sys
 
 from .. import proc, user_config
+from . import ai_activity  # ClipMint AI Activity Dashboard v1
+from . import gpu_handoff  # ClipMint GPU handoff v1
 from ..config import LOCAL_OUTPUT_DIR, LOCAL_WHISPER_DEVICE, LOCAL_WHISPER_MODEL
 
 
+_CUDA_DLL_DIRECTORY_HANDLES = []
+_CUDA_DLL_REGISTERED_PATHS = set()
+
+
 def _register_cuda_dlls() -> None:
-    """Put the pip-installed CUDA libraries on Windows' DLL search path.
+    """Register CUDA 12/cuDNN 9 DLL folders on Windows for CTranslate2.
 
-    nvidia-cublas-cu12 and nvidia-cudnn-cu12 drop their DLLs under
-    site-packages/nvidia/*/bin, which Python 3.8+ does NOT search -- and
-    CTranslate2, unlike torch, never registers them. The result is a GPU that
-    is present, a model that constructs, and an inference call that dies on
-    "cublas64_12.dll is not found". Registering the directories is the whole
-    fix; without it, installing the wheels changes nothing at all.
+    Python 3.8+ and frozen apps don't automatically search the system PATH
+    for DLLs used by ctypes/CTranslate2. Keep the handles returned by
+    ``os.add_dll_directory`` for the entire process lifetime: dropping them
+    unregisters the directories immediately.
 
-    Frozen builds keep the same layout under the unpack root, so both are
-    checked. Missing directories are ordinary: a CPU-only install has none,
-    and the caller falls back on its own.
+    Look for bundled and pip-installed NVIDIA libraries first, then external
+    CUDA 12 Toolkits and cuDNN 9 installations. Never mix in cuDNN for CUDA 13.
     """
     if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
 
+    dirs = []
     roots = []
     try:
         import nvidia  # type: ignore
@@ -44,12 +49,40 @@ def _register_cuda_dlls() -> None:
 
     for root in roots:
         for lib in ("cublas", "cudnn", "cuda_nvrtc", "cuda_runtime"):
-            d = root / lib / "bin"
-            if d.is_dir():
-                try:
-                    os.add_dll_directory(str(d))
-                except OSError:
-                    pass    # already registered, or gone between check and use
+            dirs.append(root / lib / "bin")
+
+    # A regular Windows CUDA install (including the user's CUDA 12.8).
+    for name in ("CUDA_PATH", "CUDA_PATH_V12_9", "CUDA_PATH_V12_8",
+                 "CUDA_PATH_V12_7", "CUDA_PATH_V12_6"):
+        value = os.environ.get(name)
+        if value:
+            toolkit = Path(value)
+            if toolkit.name.lower().startswith("v12"):
+                dirs.append(toolkit / "bin")
+
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    cuda_root = program_files / "NVIDIA GPU Computing Toolkit" / "CUDA"
+    if cuda_root.is_dir():
+        dirs.extend(sorted(cuda_root.glob("v12*/bin"), reverse=True))
+
+    # NVIDIA installs cuDNN separately at e.g.
+    # C:\Program Files\NVIDIA\CUDNN\v9.27\bin\12.9\x64.
+    cudnn_root = program_files / "NVIDIA" / "CUDNN"
+    if cudnn_root.is_dir():
+        dirs.extend(sorted(cudnn_root.glob("v9*/bin/12*/x64"), reverse=True))
+
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        key = os.path.normcase(os.path.abspath(str(directory)))
+        if key in _CUDA_DLL_REGISTERED_PATHS:
+            continue
+        try:
+            handle = os.add_dll_directory(str(directory))
+        except OSError:
+            continue
+        _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
+        _CUDA_DLL_REGISTERED_PATHS.add(key)
 
 
 def _cache_candidates(media_path: str) -> List[Path]:
@@ -208,6 +241,7 @@ def _resolve_device() -> str:
     return device
 
 
+@ai_activity.trace_transcription
 def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
     """Run faster-whisper on a local file path, caching the result as .srt."""
     cache_path = _find_cached_transcript(media_path)
@@ -239,6 +273,8 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
         ) from e
 
     device = _resolve_device()
+    if device == "cuda":
+        gpu_handoff.prepare_cuda_transcription()
     compute_type = "float16" if device == "cuda" else "int8"
     print(f"[transcribe/local] faster-whisper model={LOCAL_WHISPER_MODEL} device={device}", flush=True)
 
@@ -267,31 +303,46 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
         so the retry has to be able to redo the whole thing.
         """
         model = WhisperModel(LOCAL_WHISPER_MODEL, device=dev, compute_type=ct)
-        segments_iter, info = model.transcribe(**transcribe_kwargs)
-        # The longest stage by far, and until now it said nothing at all
-        # between "transcribing on the CPU" and its result -- half an hour of
-        # an app that looks stuck. The segments arrive in order, so each one
-        # says how far in we are.
-        total = float(getattr(info, "duration", 0.0) or 0.0)
-        last_said = 0.0
-        out = []
-        for s in segments_iter:
-            # Transcription runs inside this process, so Pause cannot suspend
-            # it the way it suspends ffmpeg. The generator is lazy, though:
-            # holding here stops the model decoding the next window, on the
-            # CPU or the GPU alike, until the run is resumed.
-            proc.wait_if_paused()
-            now = time.time()
-            if total and now - last_said >= 2.5:
-                last_said = now
-                print(f"[transcribe/local] {min(99, int(100 * float(s.end) / total))}% "
-                      f"- {_mmss(s.end)} of {_mmss(total)}", flush=True)
-            out.append({
-                "start": float(s.start),
-                "end": float(s.end),
-                "text": (s.text or "").strip(),
-            })
-        return out, info
+        try:
+            segments_iter, info = model.transcribe(**transcribe_kwargs)
+            # The longest stage by far, and until now it said nothing at all
+            # between "transcribing on the CPU" and its result -- half an hour of
+            # an app that looks stuck. The segments arrive in order, so each one
+            # says how far in we are.
+            total = float(getattr(info, "duration", 0.0) or 0.0)
+            last_said = 0.0
+            out = []
+            for s in segments_iter:
+                # Transcription runs inside this process, so Pause cannot suspend
+                # it the way it suspends ffmpeg. The generator is lazy, though:
+                # holding here stops the model decoding the next window, on the
+                # CPU or the GPU alike, until the run is resumed.
+                proc.wait_if_paused()
+                now = time.time()
+                if total and now - last_said >= 2.5:
+                    last_said = now
+                    print(f"[transcribe/local] {min(99, int(100 * float(s.end) / total))}% "
+                          f"- {_mmss(s.end)} of {_mmss(total)}", flush=True)
+                out.append({
+                    "start": float(s.start),
+                    "end": float(s.end),
+                    "text": (s.text or "").strip(),
+                })
+            return out, info
+        finally:
+            # Close the generator before releasing CTranslate2 VRAM.
+            iterator = locals().get('segments_iter')
+            close = getattr(iterator, 'close', None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            del iterator
+            gpu_handoff.release_whisper_model(model, dev)
+            del model
+            gc.collect()
+            gpu_handoff.whisper_cleanup_done(dev)
 
     try:
         segments, info = _run(device, compute_type)

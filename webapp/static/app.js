@@ -304,6 +304,68 @@ async function checkOllama() {
 }
 $("ollamaRetry").onclick = checkOllama;
 
+// ClipMint task-specific AI providers v1. Loaded in the existing Settings drawer.
+const AI_TASK_IDS = {highlight: "Highlight", vision: "Vision", seo: "Seo"};
+
+async function loadAiTasks() {
+  try {
+    const d = await api("/api/ai/tasks");
+    for (const [stage, suffix] of Object.entries(AI_TASK_IDS)) {
+      const s = d.stages[stage];
+      if (!s) continue;
+      $("ai" + suffix).value = s.provider;
+      $("ai" + suffix + "Model").value = s.model_override || "";
+      $("ai" + suffix + "Model").placeholder = s.model
+        ? `Current: ${s.model}` : "Use provider's default model";
+      $("ai" + suffix).disabled = !!s.provider_pinned;
+      $("ai" + suffix + "Model").disabled = !!s.model_pinned;
+      $("ai" + suffix + "Health").textContent =
+        `${s.health.ready ? "Configured" : "Needs attention"}: ${s.health.message}`;
+    }
+  } catch (e) {
+    $("aiTaskMessage").textContent = `Could not read task AI settings: ${e.message || e}`;
+  }
+}
+
+// Switching provider clears any prior provider-specific model override.
+for (const [stage, suffix] of Object.entries(AI_TASK_IDS)) {
+  $("ai" + suffix).addEventListener("change", () => {
+    $("ai" + suffix + "Model").value = "";
+    $("ai" + suffix + "Health").textContent = "Unsaved choice — save to validate model and API key";
+  });
+}
+
+$("aiRecommended").onclick = () => {
+  $("aiHighlight").value = "gemini";
+  $("aiVision").value = "gemini";
+  $("aiSeo").value = "ollama";
+  $("aiHighlightModel").value = "";
+  $("aiVisionModel").value = "";
+  $("aiSeoModel").value = "";
+  $("aiTaskMessage").textContent = "Recommended choices selected. Click Save to validate your keys and model.";
+};
+
+$("aiTaskSave").onclick = async () => {
+  const btn = $("aiTaskSave"), msg = $("aiTaskMessage");
+  btn.disabled = true;
+  msg.textContent = "Validating all three providers...";
+  try {
+    const payload = {};
+    for (const [stage, suffix] of Object.entries(AI_TASK_IDS)) {
+      payload[stage + "_provider"] = $("ai" + suffix).value;
+      payload[stage + "_model"] = $("ai" + suffix + "Model").value.trim();
+    }
+    await api("/api/ai/tasks", json("POST", payload));
+    await loadAiTasks();
+    await checkOllama();
+    msg.textContent = "Saved. Highlight, Vision and SEO now use independent AI providers.";
+  } catch (e) {
+    msg.textContent = `Not saved: ${e.message || e}`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 // ---------------------------------------------------------------- profiles
 //
 // One app, several channels. The server decides which profile is active; the
@@ -692,7 +754,9 @@ async function refreshUsage() {
     $("usageInfo").innerHTML = rows.join("");
 
     let hint;
-    if (g && g.exhausted && u.fallback_ready) {
+    if (u.task_routing) {
+      hint = "Highlight, Vision and SEO use their chosen AI providers. No automatic paid fallback; change the relevant task in Settings if its provider is unavailable.";
+    } else if (g && g.exhausted && u.fallback_ready) {
       hint = `Gemini is out for today — runs will continue on ${u.fallback_to || "OpenAI"} automatically.`;
     } else if (g && g.exhausted) {
       hint = "Gemini is out for today. Add a spare Gemini key, or a free Groq or OpenRouter "
@@ -2913,6 +2977,7 @@ async function run() {
   $("go").textContent = "Working…";
   // The clips already on disk stay on screen while the new run works.
   $("log").textContent = "";
+  paintAiActivity({ai_activity: [], ai_usage: {}});
   $("progress").classList.remove("hidden");
   $("progress").scrollIntoView({ behavior: "smooth", block: "center" });
   showErr("");
@@ -3023,6 +3088,7 @@ async function retryRun(id, clipsOnly) {
 }
 
 function onUpdate(s) {
+  paintAiActivity(s);
   // The server is the authority on this: a pause survives a page reload, and
   // the button has to agree with what the worker is actually doing.
   if (s.paused !== undefined && s.paused !== paused) renderPauseState(s.paused);
@@ -3053,6 +3119,68 @@ function onUpdate(s) {
   }
   if (s.status === "done" || s.status === "error") { renderPauseState(false); finish(s); }
   if (s.status === "interrupted") { renderPauseState(false); stopped(s); }
+}
+
+// ClipMint AI Activity Dashboard v1 — streamed with the existing job snapshot.
+async function stopAiRewriteWatch(state) {
+  if (!state) return;
+  clearInterval(state.timer);
+  try {
+    const data = await api(`/api/jobs/${encodeURIComponent(state.id)}`);
+    paintAiActivity(data);
+  } catch (_) { /* an unavailable activity snapshot does not block a rewrite */ }
+}
+
+function startAiRewriteWatch(id) {
+  if (!id) return null;
+  const panel = $("progress");
+  panel.classList.remove("hidden");
+  const state = {id, timer: null, busy: false};
+  const tick = async () => {
+    if (state.busy) return;
+    state.busy = true;
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      paintAiActivity(data);
+    } catch (_) { /* best-effort read */ }
+    finally { state.busy = false; }
+  };
+  tick();
+  state.timer = setInterval(tick, 850);
+  return state;
+}
+
+function paintAiActivity(s) {
+  const events = Array.isArray(s.ai_activity) ? s.ai_activity : [];
+  const usage = s.ai_usage || {};
+  const cloud = Number(usage.cloud_requests || 0);
+  const req = Number(usage.requests || 0);
+  const ok = Number(usage.completed || 0);
+  const fail = Number(usage.failed || 0);
+  const fallback = Number(usage.fallbacks || 0);
+  $("aiActivityCount").textContent = `${req} AI request${req === 1 ? "" : "s"}`;
+  $("aiActivityKpis").textContent = `${ok} completed · ${fail} failed · ${cloud} cloud attempts`
+    + (fallback ? ` · ${fallback} provider fallback${fallback === 1 ? "" : "s"}` : "");
+  if (!events.length) {
+    $("aiActivityRows").textContent = "No AI calls recorded yet. Transcription and AI requests will appear here as they run.";
+    return;
+  }
+  const stageName = {highlight:"Highlight & subject",vision:"Vision",seo:"SEO & Rewrite",
+    edit:"Edit AI",transcribe:"Transcription",other:"Other AI"};
+  const duration = (ms) => ms == null ? "running" : `${(Number(ms) / 1000).toFixed(2)}s`;
+  // Escape every text field, even though the backend only returns metadata.
+  $("aiActivityRows").innerHTML = events.slice(-40).reverse().map((e) => {
+    const state = e.status === "success" ? "Done" : e.status === "error" ? "Failed" : "Running";
+    const css = e.status === "success" ? "ok" : e.status === "error" ? "err" : "running";
+    const role = stageName[e.stage] || e.stage || "AI";
+    const device = e.device ? ` · ${e.device}` : "";
+    const problem = e.error ? ` · ${e.error}` : "";
+    return `<div class="ai-entry"><div class="ai-entry-top"><strong>${esc(role)}</strong>`
+      + `<span class="ai-state ai-${css}">${esc(state)}</span></div>`
+      + `<div class="ai-entry-sub">${esc(e.provider || "Unknown")} · ${esc(e.model || "—")}`
+      + `${esc(device)} · ${esc(duration(e.duration_ms))}${e.fallback ? " · Fallback" : ""}`
+      + `${esc(problem)}</div></div>`;
+  }).join("");
 }
 
 // ---------------------------------------------------------------- the clock
@@ -3494,6 +3622,7 @@ async function copy(text, okMsg) {
 // Writing metadata costs an LLM call, and for clips with no transcript on
 // record a short transcription too — so it runs on request, not on load.
 async function writeSeoForRun(runId, btn, force) {
+  const aiWatch = startAiRewriteWatch(runId);
   const label = btn ? btn.innerHTML : "";
   if (btn) { btn.disabled = true; btn.textContent = "Writing…"; }
   try {
@@ -3508,6 +3637,7 @@ async function writeSeoForRun(runId, btn, force) {
     // the message that explains why the titles did not change.
     toast(e.message || "Could not write the metadata.", true);
   } finally {
+    await stopAiRewriteWatch(aiWatch);
     if (btn) { btn.disabled = false; btn.innerHTML = label; }
   }
 }
@@ -4067,6 +4197,7 @@ $("seoRedo").onclick = () => {
 };
 
 async function rewriteSeo() {
+  const aiWatch = startAiRewriteWatch(jobOf(clips[cur]));
   const c = clips[cur];
   if (!c) return;
   const btn = $("seoRedo");
@@ -4120,6 +4251,7 @@ async function rewriteSeo() {
   } catch (e) {
     $("seoMsg").innerHTML = `<div class="err">${esc(e.message)}</div>`;
   } finally {
+    await stopAiRewriteWatch(aiWatch);
     busy(false);
     btn.disabled = false;
   }
@@ -4789,6 +4921,7 @@ $("pMini").onclick = () => {
 
 keyLinkFor($("setProvider").value);
 checkOllama();  // every ClipMint open: local API + installed model
+loadAiTasks();
 loadProfiles();
 checkSetup();
 refreshUsage();

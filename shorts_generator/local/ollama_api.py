@@ -33,10 +33,10 @@ def _request(endpoint: str, payload: dict | None = None, timeout: int | float = 
     return data
 
 
-def status(timeout: float = 2.0) -> dict:
+def status(timeout: float = 2.0, model: str | None = None) -> dict:
     """Quick startup check. Verifies server AND installed model, not whether loaded."""
     from shorts_generator.config import current_model
-    model = current_model("ollama")
+    model = model or current_model("ollama")
     try:
         data = _request("/api/tags", timeout=timeout)
         models = sorted({str(x.get("name") or x.get("model") or "")
@@ -49,7 +49,11 @@ def status(timeout: float = 2.0) -> dict:
                 "models": [], "error": str(exc).splitlines()[0][:240]}
 
 
-def generate(prompt: str) -> str:
+from . import ai_activity  # ClipMint AI Activity Dashboard v1
+
+
+@ai_activity.trace_provider("ollama")
+def generate(prompt: str, model: str | None = None) -> str:
     """Text generation via Ollama /api/generate using 4K context and JSON mode.
 
     SEO uses short per-clip prompts. For older/general ClipMint prompts, retain
@@ -57,12 +61,12 @@ def generate(prompt: str) -> str:
     """
     from shorts_generator.config import current_model
     from shorts_generator import user_config
-    state = status(timeout=2)
+    model = model or current_model("ollama")
+    state = status(timeout=2, model=model)
     if not state["running"]:
         raise RuntimeError("Ollama is not running. Open Ollama or run 'ollama serve', then retry.")
     if not state["model_installed"]:
         raise RuntimeError(state["error"])
-    model = current_model("ollama")
     # Mixed text scripts can consume more than one token per character.
     # With a 4096-token context, this is an upper bound, not a guarantee.
     if len(prompt) > 9000:

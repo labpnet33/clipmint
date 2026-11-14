@@ -27,6 +27,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .viral_moments import complete_punchline_end  # CLIPMINT_VIRAL_V1
+
 from .signals import (
     MIN_OPENING_DENSITY,
     OPENING_WINDOW,
@@ -314,6 +316,10 @@ def refine(highlights: List[Dict], transcript: Optional[Dict],
         start, idx, notes = _choose_start(segments, h, audio)
         end, more = _choose_end(segments, idx, start, original[1], lo, hi, audio)
         notes += more
+        # Only rescue a transcript-confirmed unfinished line or reaction.
+        # The user's clip-length ceiling remains in force.
+        end, extra = complete_punchline_end(segments, start, end, hi)
+        notes.extend(extra)
         if limit > 0 and end > limit:
             end = limit
             notes.append("ran to the end of the video")

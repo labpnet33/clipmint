@@ -420,6 +420,12 @@ addEventListener("load", function () {
       </div>
       <div class="bar"><i id="barFill"></i></div>
       <div class="steps" id="steps"></div>
+      <!-- ClipMint AI Activity Dashboard v1: actual calls, never API secrets -->
+      <details class="ai-activity" id="aiActivityPanel" open>
+        <summary>Live AI Activity <span id="aiActivityCount">0 requests</span></summary>
+        <div class="ai-kpis" id="aiActivityKpis" aria-live="polite">No AI requests yet.</div>
+        <div class="ai-rows" id="aiActivityRows">Activity appears as each task calls its selected AI.</div>
+      </details>
       <div class="prow">
         <button class="btn ghost sm" id="pauseBtn" title="Pause the work and give your CPU back">
           <svg><use href="#i-pause"/></svg><span id="pauseLabel">Pause</span>
@@ -671,9 +677,33 @@ addEventListener("load", function () {
   </div>
 
   <div class="d-sec">
-    <h3>Model</h3>
+    <h3>Default AI provider (legacy)</h3>
+    <p class="hint">Used for older workflows or stages not separately configured below.</p>
     <div class="kv" id="setInfo"></div>
     <p class="hint" id="ollamaSettingsStatus">Ollama: Checking...</p>
+    <!-- ClipMint task-specific AI providers v1: existing Settings drawer -->
+    <div id="aiTaskSection">
+      <h3>AI provider by task</h3>
+      <p class="hint">Choose each engine independently. Cloud providers consume their own API limits. No automatic paid fallback.</p>
+      <label class="fld"><span>Highlight AI (subject + ranking)</span>
+        <select id="aiHighlight"><option value="ollama">Ollama (local)</option><option value="gemini">Gemini</option><option value="groq">Groq</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option></select>
+      </label>
+      <label class="fld"><span>Highlight model (optional override)</span><input id="aiHighlightModel" type="text" placeholder="Use provider's existing model" spellcheck="false"></label>
+      <p class="hint" id="aiHighlightHealth"></p>
+      <label class="fld"><span>Vision AI (frame understanding)</span>
+        <select id="aiVision"><option value="off">Off (no cloud requests)</option><option value="gemini">Gemini</option><option value="groq">Groq vision</option><option value="openrouter">OpenRouter vision model</option><option value="openai">OpenAI vision model</option></select>
+      </label>
+      <label class="fld"><span>Vision model (optional override)</span><input id="aiVisionModel" type="text" placeholder="Use provider's vision model" spellcheck="false"></label>
+      <p class="hint" id="aiVisionHealth"></p>
+      <label class="fld"><span>SEO AI (titles, descriptions + Rewrite)</span>
+        <select id="aiSeo"><option value="ollama">Ollama (local)</option><option value="gemini">Gemini</option><option value="groq">Groq</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option></select>
+      </label>
+      <label class="fld"><span>SEO model (optional override)</span><input id="aiSeoModel" type="text" placeholder="Use provider's existing model" spellcheck="false"></label>
+      <p class="hint" id="aiSeoHealth"></p>
+      <button class="btn ghost sm" id="aiRecommended">Select Gemini / Gemini / Ollama</button>
+      <button class="btn primary sm" id="aiTaskSave">Save AI task providers</button>
+      <p class="hint" role="status" aria-live="polite" id="aiTaskMessage"></p>
+    </div>
     <button class="btn ghost sm" id="ollamaRetry">Check Ollama now</button>
     <label class="fld">
       <span>Provider</span>

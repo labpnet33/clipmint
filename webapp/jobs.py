@@ -34,6 +34,7 @@ from shorts_generator.layout_spec import LayoutSpec
 
 from shorts_generator import user_config
 from . import notify
+from shorts_generator.local import ai_activity  # ClipMint AI Activity Dashboard v1
 
 # Written into each job's folder so the run can be reconstructed later.
 MANIFEST_NAME = "job.json"
@@ -283,6 +284,7 @@ class Job:
     # months later files the clips under the same name as the original run.
     subject: Dict = field(default_factory=dict)
     log: List[str] = field(default_factory=list)
+    ai_activity: List[Dict] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     # Where this job's clips actually live. Set for jobs read back from disk,
     # so moving the save location can't strand the ones already rendered.
@@ -341,6 +343,8 @@ class Job:
                         if self.started_at else None),
             "eta_seconds": self.eta_seconds(),
             "paused": self.status == "running" and proc.is_paused(),
+            "ai_activity": self.ai_activity[-ai_activity.MAX_EVENTS:],
+            "ai_usage": ai_activity.summarize(self.ai_activity),
             "log": self.log[-60:],
             "version": self._version,
         }
@@ -386,6 +390,7 @@ class Job:
             "subject": self.subject,
             "spec": self.spec.to_dict(),
             "clips": self.clips,
+            "ai_activity": [e for e in self.ai_activity[-ai_activity.MAX_EVENTS:] if e.get("status") != "running"],
         }
 
 
@@ -815,6 +820,7 @@ class JobStore:
             clips=clips,
             video_meta=manifest.get("video_meta") or {},
             subject=manifest.get("subject") or {},
+            ai_activity=[e for e in (manifest.get("ai_activity") or [])[-ai_activity.MAX_EVENTS:] if isinstance(e, dict)],
             created_at=created,
             folder=str(folder),
             restored=True,
@@ -854,12 +860,49 @@ class JobStore:
         if moved:
             self._persist(job)
 
+    # ClipMint AI Activity Dashboard v1: job-bound, memory-limited, no prompts or keys.
+    def _record_ai(self, job: Job, event: Dict) -> None:
+        with self._lock:
+            existing = next((e for e in reversed(job.ai_activity)
+                             if e.get("id") == event.get("id")), None)
+            if existing is None:
+                job.ai_activity.append(dict(event))
+            else:
+                # Preserve the device detected from the actual Whisper log.
+                keep_device = existing.get("device")
+                existing.update(event)
+                if keep_device and not existing.get("device"):
+                    existing["device"] = keep_device
+            if len(job.ai_activity) > ai_activity.MAX_EVENTS:
+                del job.ai_activity[:-ai_activity.MAX_EVENTS]
+            job._version += 1
+
     def _log(self, job: Job, line: str) -> None:
         line = line.rstrip()
         if not line:
             return
         with self._lock:
             job.log.append(line)
+            if "[transcribe/local] transcribing on the GPU" in line:
+                for e in reversed(job.ai_activity):
+                    if e.get("provider") == "faster-whisper" and e.get("status") == "running":
+                        e["device"] = "GPU (CUDA)"
+                        break
+            elif "[transcribe/local] transcribing on the CPU" in line:
+                for e in reversed(job.ai_activity):
+                    if e.get("provider") == "faster-whisper" and e.get("status") == "running":
+                        e["device"] = "CPU"
+                        break
+            elif "[transcribe/local] reusing cached transcript" in line:
+                for e in reversed(job.ai_activity):
+                    if e.get("provider") == "faster-whisper" and e.get("status") == "running":
+                        e["device"] = "Cached transcript"
+                        break
+            elif "[transcribe/local] the GPU stopped partway" in line:
+                for e in reversed(job.ai_activity):
+                    if e.get("provider") == "faster-whisper" and e.get("status") == "running":
+                        e["device"] = "CPU fallback"
+                        break
             job._version += 1
 
         for pattern, stage in _PREFIX_STAGE:
@@ -922,7 +965,8 @@ class JobStore:
                 job.started_at = time.time()
                 job.finished_at = None
             try:
-                self._execute(job)
+                with ai_activity.watch(job.id, lambda event: self._record_ai(job, event)):
+                    self._execute(job)
             except Exception as e:
                 # Whatever it surfaced as -- a stage wraps what it catches --
                 # an error after Stop was pressed is the stop, not a failure.
@@ -1012,10 +1056,10 @@ class JobStore:
         half-written file from the failed attempt cannot be mistaken for it,
         and _finalize renames every clip to its title anyway.
         """
-        from shorts_generator.local.llm import call_local_llm
+        from shorts_generator.local.task_routing import call_highlight_llm
         from shorts_generator.render import render_highlights
 
-        extra = {"language": job.language, "kind": job_kind(job), "llm_fn": call_local_llm}
+        extra = {"language": job.language, "kind": job_kind(job), "llm_fn": ai_activity.for_stage("edit", call_highlight_llm)}
         shorts = render_highlights(source_path, top, job.spec, out_dir=job.out_dir, **extra)
         for attempt in range(2, CLIP_ATTEMPTS + 1):
             failed = [i for i, s in enumerate(shorts) if not s.get("clip_url")]
@@ -1092,12 +1136,15 @@ class JobStore:
         from shorts_generator.highlights import get_highlights, pick, pool
         from shorts_generator.hook_open import budget as hook_budget
         from shorts_generator.judge import judge as judge_clips, pool_size as judge_pool
-        from shorts_generator.local.llm import call_vision_llm, vision_images_per_request
+        from shorts_generator.local.task_routing import (
+            call_vision_stage, vision_images_per_request_for_stage,
+            call_highlight_llm, call_seo_llm)
+        from shorts_generator.config import current_stage_provider
         from shorts_generator.seo import clip_words
         from shorts_generator.local.downloader import (
             download_youtube_local, fetch_video_meta,
         )
-        from shorts_generator.local.llm import call_local_llm, reset_fallback
+        from shorts_generator.local.llm import reset_fallback
         from shorts_generator.local.transcriber import transcribe_local
         from shorts_generator.render import render_highlights
         from shorts_generator.seo import attach_seo, detect_subject
@@ -1159,7 +1206,7 @@ class JobStore:
                     for i, (a, b) in enumerate(job.spec.time_ranges, 1)
                 ]
                 all_highlights = list(top)
-                subject = detect_subject(job.video_meta, None, job.source, call_local_llm)
+                subject = detect_subject(job.video_meta, None, job.source, ai_activity.for_stage("highlight", call_highlight_llm))
                 if job.spec.content_kind != "auto":
                     subject["content_kind"] = job.spec.content_kind
                 with self._lock:
@@ -1167,7 +1214,7 @@ class JobStore:
                     job._version += 1
                 _look_at_clips(job, top, source_path, None, subject)
                 attach_seo(top, transcript=None, video_meta=job.video_meta,
-                           source=job.source, llm_fn=call_local_llm, subject=subject)
+                           source=job.source, llm_fn=ai_activity.for_stage("seo", call_seo_llm), subject=subject)
                 self._update(job, stage="render", frac=0.0,
                              message=_STAGE_LABELS["render"])
                 shorts = self._render(job, source_path, top)
@@ -1232,7 +1279,7 @@ class JobStore:
             # chunks that never came back.
             result = self._attempt("ranking", get_highlights,
                                     transcript, num_clips=job.spec.num_clips,
-                                    llm_fn=call_local_llm,
+                                    llm_fn=ai_activity.for_stage("highlight", call_highlight_llm),
                                     checkpoint_path=checkpoint,
                                     clip_seconds=job.spec.clip_seconds,
                                     brief=job.spec.brief,
@@ -1255,13 +1302,14 @@ class JobStore:
             # re-ranked on that -- see shorts_generator/judge.py.
             self._update(job, frac=0.5, message="Watching the best moments like a stranger would")
             looked = pool(all_highlights, judge_pool(job.spec.num_clips), job.spec.asks)
-            try:
-                judge_clips(looked, source_path, call_vision_llm,
-                            lambda h: clip_words(h, transcript),
-                            kind=content.get("kind") or "",
-                            images_per_request=vision_images_per_request())
-            except Exception as e:  # noqa: BLE001 - a second opinion is never worth the run
-                print(f"[judge] skipped ({e})", flush=True)
+            if current_stage_provider("vision") != "off":
+                try:
+                    judge_clips(looked, source_path, ai_activity.for_stage("vision", call_vision_stage),
+                                lambda h: clip_words(h, transcript),
+                                kind=content.get("kind") or "",
+                                images_per_request=vision_images_per_request_for_stage())
+                except Exception as e:  # noqa: BLE001 - a second opinion is never worth the run
+                    print(f"[judge] skipped ({e})", flush=True)
 
             # Best first, and it stays that way all the way to the grid: the
             # order the user sees is the order worth posting in.
@@ -1279,7 +1327,7 @@ class JobStore:
             # hashtag in this run is then filed under the same thing, instead
             # of ten clips inventing ten ways to say it.
             subject = detect_subject(job.video_meta, transcript, job.source,
-                                     call_local_llm)
+                                     ai_activity.for_stage("highlight", call_highlight_llm))
             # Kept with the subject, so the packaging is written for the kind
             # of video this is -- now, and on every rewrite after.
             subject["content_kind"] = content.get("kind") or ""
@@ -1293,7 +1341,7 @@ class JobStore:
             _look_at_clips(job, top, source_path, transcript, subject)
             self._update(job, frac=0.8, message="Writing titles, tags and hooks")
             attach_seo(top, transcript=transcript, video_meta=job.video_meta,
-                       source=job.source, llm_fn=call_local_llm, subject=subject)
+                       source=job.source, llm_fn=ai_activity.for_stage("seo", call_seo_llm), subject=subject)
 
             self._update(job, stage="render", frac=0.0, message=_STAGE_LABELS["render"])
             shorts = self._render(job, source_path, top)
@@ -1368,6 +1416,7 @@ class JobStore:
                 "pre_judge_score": s.get("pre_judge_score"),
                 "on_screen": s.get("on_screen"),
                 "boundary_notes": s.get("boundary_notes"),
+                "moment_integrity": s.get("moment_integrity"),  # CLIPMINT_VIRAL_V1
                 "hook_replay_seconds": s.get("hook_replay_seconds"),
                 # Where its loudest moment is, so a clip rendered again later
                 # still gets its cold open.
@@ -1485,7 +1534,11 @@ def _look_at_clips(job: Job, highlights: List[Dict], source_path: Optional[str],
     and otherwise from the rendered clip itself. Best-effort: a clip that
     cannot be looked at keeps no scene and is written from its words.
     """
-    from shorts_generator.local.llm import call_vision_llm, vision_images_per_request
+    from shorts_generator.local.task_routing import (
+        call_vision_stage, vision_images_per_request_for_stage)
+    from shorts_generator.config import current_stage_provider
+    if current_stage_provider("vision") == "off":
+        return
     from shorts_generator.seo import clip_words, describe_video
     from shorts_generator.vision import describe_clips
 
@@ -1508,10 +1561,10 @@ def _look_at_clips(job: Job, highlights: List[Dict], source_path: Optional[str],
     subject = subject or {}
     candidates = [subject.get("subject") or ""] + list(subject.get("all_subjects") or [])
     try:
-        scenes = describe_clips(items, call_vision_llm,
+        scenes = describe_clips(items, ai_activity.for_stage("vision", call_vision_stage),
                                 video_context=describe_video(job.video_meta, job.source),
                                 candidates=candidates,
-                                images_per_request=vision_images_per_request())
+                                images_per_request=vision_images_per_request_for_stage())
     except Exception as e:  # noqa: BLE001 - never worth losing a run over
         print(f"[vision] skipped ({e})", flush=True)
         return
@@ -1529,8 +1582,8 @@ def regenerate_seo(store: "JobStore", job: Job, force: bool = False,
     mp4 itself. `only` rewrites a single clip by filename, keeping the rest of
     the run's titles in view so the new one does not open the same way.
     """
-    from shorts_generator.local.llm import call_local_llm
-    from shorts_generator.seo import generate_seo
+    from shorts_generator.local.task_routing import call_seo_llm, call_highlight_llm
+    from shorts_generator.seo import generate_seo, detect_subject
 
     with store._lock:
         if only:
@@ -1582,9 +1635,11 @@ def regenerate_seo(store: "JobStore", job: Job, force: bool = False,
                 h["end_time"] = float(c.get("end_time") or c.get("duration") or 0.0)
 
     errors: List[str] = []
+    # Old saved jobs may lack a subject. Classify with Highlight AI, not SEO AI.
+    subject = job.subject or detect_subject(job.video_meta, None, job.source, ai_activity.for_stage("highlight", call_highlight_llm))
     written = generate_seo(highlights, video_meta=job.video_meta,
-                           source=job.source, llm_fn=call_local_llm,
-                           errors=errors, subject=job.subject or None,
+                           source=job.source, llm_fn=ai_activity.for_stage("seo", call_seo_llm),
+                           errors=errors, subject=subject,
                            avoid_titles=[t for t in others if t])
 
     # Only keep what a model actually wrote, or fill a clip that had nothing at

@@ -1430,8 +1430,8 @@ def generate_seo(
     avoid = [t for t in (avoid_titles or []) if t]
     avoid_block = ("\nALREADY POSTED FROM THIS VIDEO - do not open any title the way these open:\n"
                    + "\n".join(f"- {t}" for t in avoid[:12]) + "\n") if avoid else ""
-    from shorts_generator.config import current_provider
-    local_ollama = current_provider() == "ollama"
+    from shorts_generator.config import current_stage_provider
+    local_ollama = current_stage_provider("seo") == "ollama"
     guide = playbook.prompt_text()
     _, where = playbook.load()
     print(f"[seo] writing for YouTube Shorts, Instagram Reels and TikTok from the {where}",
