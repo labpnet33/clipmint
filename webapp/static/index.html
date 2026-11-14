@@ -164,6 +164,7 @@ addEventListener("load", function () {
         <label class="fld">
           <span>Provider</span>
           <select id="setProvider">
+            <option value="ollama">Ollama &mdash; local, no API key</option>
             <option value="gemini" selected>Google Gemini &mdash; free tier</option>
             <option value="groq">Groq &mdash; free, no card</option>
             <option value="openrouter">OpenRouter &mdash; free models, any lab</option>
@@ -178,6 +179,9 @@ addEventListener("load", function () {
       <button class="btn primary" id="setSave">Save and continue</button>
       <div id="setMsg"></div>
     </section>
+
+    <!-- Local model is checked at EVERY ClipMint launch, never blocks startup. -->
+    <p class="hint" id="ollamaStatusBar" role="status" aria-live="polite">Ollama: Checking local AI...</p>
 
     <!-- chip bar -->
     <div class="chipbar-wrap">
@@ -669,9 +673,12 @@ addEventListener("load", function () {
   <div class="d-sec">
     <h3>Model</h3>
     <div class="kv" id="setInfo"></div>
+    <p class="hint" id="ollamaSettingsStatus">Ollama: Checking...</p>
+    <button class="btn ghost sm" id="ollamaRetry">Check Ollama now</button>
     <label class="fld">
       <span>Provider</span>
       <select id="setProvider2">
+        <option value="ollama">Ollama &mdash; local, no API key</option>
         <option value="gemini">Google Gemini &mdash; free tier</option>
         <option value="groq">Groq &mdash; free, no card</option>
         <option value="openrouter">OpenRouter &mdash; free models, any lab</option>

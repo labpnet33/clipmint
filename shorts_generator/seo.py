@@ -140,6 +140,12 @@ SOURCE VIDEO
 
 You are given {n} clips cut from that video, already ranked best to worst by viral potential. For EACH clip, write upload-ready metadata.
 
+LANGUAGE, AUDIENCE AND COMEDY:
+- Match how people ACTUALLY speak in this clip. When its dialogue is Hindi/Hinglish, write natural conversational Hinglish in Roman script, with familiar English keywords and original names intact. Avoid literal translations, formal "shuddh Hindi", and awkward English copied from transcripts. When the clip is English-only, write natural English instead. Do not force Hinglish onto another language.
+- Stand-up, jokes, and comic reactions: write about the REAL setup and payoff contained in THIS clip, with an entertaining but truthful angle. Avoid clickbait claims (shocked audience, controversy, sums of money) unless the spoken words or frames actually support them.
+- Make titles sound like a human creator wrote them, not the first spoken line or a translated transcript. Keep any numbers, people, and context faithful to what is heard or seen.
+- Never repeat another title from the batch or any earlier title supplied under ALREADY POSTED. This rule applies to rewrites too.
+
 THE TWO RULES THAT OUTRANK EVERYTHING BELOW:
 1. ACCURATE. Every claim must be provable from that clip's own WHAT IS ON SCREEN and WHAT IS ACTUALLY SAID blocks. Never promise a reveal the clip does not contain, never name a person, game or number the clip does not support, never imply a stake the clip does not reach. A title the clip fails to deliver gets swiped in two seconds, and short-form ranking punishes that harder than a boring title ever could.
 2. VIRAL. Within what is true, pick the most arresting framing. The strongest hook is almost always a real specific detail from the clip - the exact number, the exact word, the actual thing that happened on screen - not a vague tease. Specific and true beats sensational and empty every time.
@@ -230,6 +236,10 @@ GROWTH PLAYBOOK
 {playbook}
 
 {subject_block}
+
+LANGUAGE AND VOICE:
+- For Hindi/Hinglish dialogue, write Reels and TikTok captions in natural Roman-script Hinglish, keeping English keywords and names readable; for English dialogue, write natural English. Never invent a punchline, a reaction or an event absent from the clip.
+- For comedy/stand-up, lead with the actual funny situation, not a generic viral claim; avoid repeated or machine-translated openings.
 
 THE RULES THAT OUTRANK EVERYTHING BELOW:
 1. ACCURATE. Nothing the clip does not deliver. Name a person, game or show only when that clip's block says the subject is CONFIRMED; otherwise use the genre.
@@ -566,6 +576,31 @@ def _index_items(items: object, n: int) -> Dict[int, Dict]:
     if all(k is not None and 1 <= k <= n for k in said) and len(set(said)) == len(said):
         return dict(zip(said, items))
     return {k: item for k, item in enumerate(items[:n], 1)}
+
+
+# ClipMint SEO quality upgrade: shared initial generation and Rewrite
+
+def _usable_metadata(item: Dict, highlight: Dict, subject: Optional[Dict]) -> bool:
+    """Require an AI-written title and description before marking SEO generated.
+
+    A JSON object with just an index is not AI-written metadata. An item whose
+    title options all fail the truth checks is also not a usable title.
+    Incomplete results go back through the existing bounded retry ladder.
+    """
+    if not isinstance(item, dict):
+        return False
+    who = clip_subject(highlight, subject)
+    titles = _rank_options(item.get("title_options"), who)
+    if not titles and item.get("title"):
+        titles = _rank_options([{"title": item["title"]}], who)
+    desc = item.get("description_options")
+    if not isinstance(desc, list):
+        desc = []
+    if item.get("description"):
+        desc = [*desc, item["description"]]
+    descriptions = [str((d.get("description") or "") if isinstance(d, dict) else (d or "")).strip()
+                    for d in desc]
+    return bool(titles and any(descriptions))
 
 
 def _clean_tag(tag: object) -> str:
@@ -1195,24 +1230,38 @@ def _coerce_social(item: Dict, entry: Dict, h: Dict, who: Dict,
     return {**base, **out}
 
 
-def _spread_leads(entries: List[Dict]) -> None:
-    """Keep two clips in one batch from leading with the same words.
+def _spread_leads(entries: List[Dict], avoid_titles: Optional[List[str]] = None) -> None:
+    """Choose distinct model titles across the batch AND away from old titles.
 
-    The prompt asks for it; this makes sure of it. Where a clip's best title
-    opens like an earlier clip's, its next-best option that does not is used
-    instead -- they will be posted to the same channel, and ten titles opening
-    the same way compete for one slice of the feed.
+    Rewrites must not silently reuse the title they were supposed to improve.
+    If the model proposes nothing distinct, keep generated=False so the
+    existing uploader/rewrite guard requires another rewrite or a human edit.
     """
-    def lead(t):
-        return " ".join(re.findall(r"[a-z0-9']+", t.lower())[:3])
-    used = set()
-    for e in entries:
-        options = e.get("title_options") or []
-        if lead(e["title"]) in used:
-            alt = next((o for o in options if lead(o["title"]) not in used), None)
-            if alt:
-                e["title"] = alt["title"]
-        used.add(lead(e["title"]))
+    def key(t: str) -> str:
+        return " ".join(re.findall(r"\w+", str(t or "").casefold()))
+
+    def lead(t: str) -> str:
+        return " ".join(key(t).split()[:3])
+
+    blocked = {key(t) for t in (avoid_titles or []) if key(t)}
+    used_titles, used_leads = set(blocked), set()
+    for entry in entries:
+        original = str(entry.get("title") or "").strip()
+        candidates = [original] + [str(o.get("title") or "").strip()
+                                   for o in (entry.get("title_options") or [])
+                                   if isinstance(o, dict)]
+        distinct = [t for t in candidates if t and key(t) not in used_titles]
+        chosen = (next((t for t in distinct if lead(t) not in used_leads), None)
+                  or next(iter(distinct), None))
+        if chosen:
+            entry["title"] = chosen
+            used_titles.add(key(chosen))
+            used_leads.add(lead(chosen))
+        elif entry.get("generated"):
+            # Do not falsely approve an AI rewrite that only repeated an old
+            # or another clip's title. The existing metadata remains intact
+            # when the caller is regenerate_seo().
+            entry["generated"] = False
 
 
 def apply_edit(existing: Optional[Dict], edit: Dict) -> Dict:
@@ -1296,6 +1345,53 @@ def apply_edit(existing: Optional[Dict], edit: Dict) -> Dict:
     return out
 
 
+# ClipMint local Ollama integration v1
+
+def _ollama_seo_prompt(h: Dict, video_meta: Optional[Dict],
+                       subject: Optional[Dict], avoid_titles: List[str],
+                       transcript: Optional[Dict] = None) -> str:
+    """Small per-clip request for a 4096-token Ollama context window.
+
+    The model writes natural Roman Hinglish only when the clip speaks Hindi.
+    It is not asked to invent punchlines, people, amounts or reactions.
+    """
+    who = clip_subject(h, subject)
+    said = clip_words(h, transcript)[:2100] or "(no speech; use visible details only)"
+    scene = _scene_block(h, subject)[:700]
+    old = "; ".join(str(t)[:95] for t in (avoid_titles or [])[:12])
+    source_title = str((video_meta or {}).get("title") or "")[:170]
+    example = {"clips": [{"index": 1,
+         "title_options": [{"title": "specific truthful hook", "angle": "detail",
+                            "hook": 35, "clarity": 18, "search": 17, "truth": 20}],
+         "description_options": [{"description": "Real event and context. #shorts #comedy",
+                                  "angle": "story", "hook": 35, "search": 25,
+                                  "clarity": 15, "truth": 15}],
+         "tags": [{"tag": "relevant term", "kind": "moment"}],
+         "hashtags": ["#shorts"], "hook_text": "short accurate hook",
+         "search_phrase": "relevant search phrase", "why_it_works": "specific true moment"}]}
+    return "\n".join([
+        "You write accurate, compelling YouTube Shorts SEO. Reply with a single JSON object only, no prose.",
+        "Write 3 DIFFERENT, searchable, non-clickbait titles (35-70 characters, max 100) "
+        "and 1 short relevant description (up to 500 characters), 5-10 tags and 3-5 hashtags.",
+        "LANGUAGE: Match the clip dialogue. Hindi/Hinglish speech => natural Roman-script Hinglish "
+        "with normal English keywords; English speech => natural English. No stiff translations.",
+        "COMEDY: Name the ACTUAL joke/setup/punchline. Don't fabricate crowd reactions, amounts, "
+        "controversies, game names or spoken words. Use confirmed names only.",
+        "Each title must use a DIFFERENT angle: specific detail, curiosity, or honest reaction. "
+        "Never simply copy the spoken line. Keep title hooks human, not generic clickbait.",
+        "Make description line 1 identify the real moment; follow with truthful context, "
+        "an optional natural question and relevant hashtags.",
+        "Do not use any of these prior titles or near-duplicates: " + (old or "(none)"),
+        "Confirmed subject: " + (who.get("subject") if who.get("confirmed") else "(none)"),
+        "Source video title: " + source_title,
+        "Visible content: " + scene,
+        "Spoken first line: " + str(h.get("first_line") or h.get("hook_sentence") or "")[:170],
+        "Actually spoken in this clip: " + said,
+        "Return JSON in this exact structural format (replace all example values with REAL details): ",
+        json.dumps(example, ensure_ascii=False),
+    ])
+
+
 def generate_seo(
     highlights: List[Dict],
     transcript: Optional[Dict] = None,
@@ -1334,6 +1430,8 @@ def generate_seo(
     avoid = [t for t in (avoid_titles or []) if t]
     avoid_block = ("\nALREADY POSTED FROM THIS VIDEO - do not open any title the way these open:\n"
                    + "\n".join(f"- {t}" for t in avoid[:12]) + "\n") if avoid else ""
+    from shorts_generator.config import current_provider
+    local_ollama = current_provider() == "ollama"
     guide = playbook.prompt_text()
     _, where = playbook.load()
     print(f"[seo] writing for YouTube Shorts, Instagram Reels and TikTok from the {where}",
@@ -1342,7 +1440,10 @@ def generate_seo(
     def ask(which: List[int]) -> Dict[int, Dict]:
         """Metadata for the clips at these 1-based positions, keyed the same way."""
         subset = [highlights[i - 1] for i in which]
-        prompt = SEO_PROMPT.format(
+        if local_ollama:
+            prompt = _ollama_seo_prompt(subset[0], video_meta, subject, avoid, transcript)
+        else:
+            prompt = SEO_PROMPT.format(
             playbook=guide or "(no playbook available - rely on what you know)",
             n=len(subset),
             options=TITLE_OPTIONS,
@@ -1354,7 +1455,14 @@ def generate_seo(
             avoid_block=avoid_block,
         )
         got = _index_items(_parse_json_loose(llm_fn(prompt)).get("clips"), len(subset))
-        return {which[k - 1]: item for k, item in got.items()}
+        valid = {}
+        for k, item in got.items():
+            if _usable_metadata(item, subset[k - 1], subject):
+                valid[which[k - 1]] = item
+            else:
+                print(f"[seo] clip {which[k - 1]}: incomplete AI title/description; retrying",
+                      flush=True)
+        return valid
 
     # One request for the whole batch, then the clips it left out asked for
     # again in small groups. Two Dying Light runs came back with 1 of 10 clips
@@ -1369,7 +1477,7 @@ def generate_seo(
     by_index: Dict[int, Dict] = {}
     todo = list(range(1, len(highlights) + 1))
     out_of_quota = ""
-    for attempt, size in enumerate((len(todo), 3, 1)):
+    for attempt, size in enumerate((1, 1, 1) if local_ollama else (len(todo), 3, 1)):
         if not todo or out_of_quota:
             break
         if attempt:
@@ -1401,12 +1509,14 @@ def generate_seo(
         item = by_index.get(i)
         out.append(_coerce_entry(item, h, video_meta, subject) if isinstance(item, dict)
                    else _fallback_for(h, video_meta, subject))
-    _spread_leads(out)
+    _spread_leads(out, avoid_titles=avoid_titles)
 
     # The second pass only builds on metadata a model actually wrote. Over a
     # fallback it would be writing Instagram copy from a filename.
-    if by_index:
+    if by_index and not local_ollama:
         _write_social(out, highlights, transcript, subject, guide, llm_fn, errors)
+    elif by_index and local_ollama:
+        print("[seo] using local-safe Reels/TikTok metadata fallback to avoid an extra large AI call", flush=True)
     for i, e in enumerate(out, 1):
         about = e.get("about") or {}
         named = about.get("subject") or (f"unnamed {about.get('genre') or ''}".strip())

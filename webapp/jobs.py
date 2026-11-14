@@ -1538,8 +1538,11 @@ def regenerate_seo(store: "JobStore", job: Job, force: bool = False,
         else:
             targets = [dict(c) for c in job.clips
                        if c.get("file") and (force or not c.get("seo"))]
+        # The same SEO engine serves first generation and Rewrite. Rewriting
+        # must avoid the clip's OWN previous title as well as its siblings'.
+        target_files = {c.get("file") for c in targets}
         others = [(c.get("seo") or {}).get("title") or "" for c in job.clips
-                  if only and c.get("file") != only]
+                  if force or only or c.get("file") not in target_files]
     if not targets:
         return 0
 

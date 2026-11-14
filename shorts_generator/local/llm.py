@@ -1,4 +1,4 @@
-"""Local LLM backend — Gemini, Groq, OpenRouter or OpenAI, selected by LLM_PROVIDER."""
+"""Local LLM backend — Ollama, Gemini, Groq, OpenRouter or OpenAI."""
 import re
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -15,7 +15,7 @@ from ..config import (
     require_openrouter_key,
 )
 
-PROVIDERS = ("gemini", "groq", "openrouter", "openai")
+PROVIDERS = ("ollama", "gemini", "groq", "openrouter", "openai")
 
 # Models whose name says they are not for ranking text.
 _NON_TEXT = ("image", "tts", "embed", "robotics", "computer-use", "transcribe",
@@ -492,6 +492,8 @@ def call_vision_llm(parts: list) -> str:
     """
     images = sum(1 for p in parts if not isinstance(p, str))
     first = _fallback_provider or current_provider()
+    if first == "ollama":
+        raise RuntimeError("qwen3:1.7b is text-only; skipping frame AI rather than using cloud credits unexpectedly")
     order = [first] + [p for p in ("gemini", "openai", "groq", "openrouter") if p != first]
     configured = {"gemini": _gemini_is_configured, "openai": _openai_is_configured,
                   "groq": _groq_is_configured, "openrouter": _openrouter_is_configured}
@@ -539,6 +541,9 @@ def call_local_llm(prompt: str) -> str:
     """
     provider = _fallback_provider or current_provider()
 
+    if provider == "ollama":
+        from .ollama_api import generate
+        return generate(prompt)
     if provider == "openai":
         return call_openai_llm(prompt)
     if provider in ("groq", "openrouter"):

@@ -127,6 +127,8 @@ def current_processor() -> str:
 
 def current_model(provider: str) -> str:
     from . import user_config
+    if provider == "ollama":
+        return user_config.get("OLLAMA_MODEL", "qwen3:1.7b")
     if provider == "openai":
         return user_config.get("OPENAI_MODEL", OPENAI_MODEL)
     if provider == "groq":

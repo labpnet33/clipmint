@@ -268,6 +268,8 @@ def has_llm_key() -> bool:
     # Read the way config.current_provider() and the require_*_key() calls
     # read it, so "has a key" here means ranking will find one.
     provider = (get("LLM_PROVIDER", "gemini") or "gemini").strip().lower()
+    if provider == "ollama":
+        return True  # Ollama uses localhost, not an API key.
     names = {"openai": "OPENAI_API_KEY", "groq": "GROQ_API_KEY",
              "openrouter": "OPENROUTER_API_KEY"}
     return bool(get(names.get(provider, "GEMINI_API_KEY")))

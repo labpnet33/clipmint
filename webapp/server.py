@@ -42,6 +42,23 @@ app = FastAPI(title="ClipMint")
 
 
 @app.on_event("startup")
+async def _check_ollama_first() -> None:
+    """Check local Ollama every launch before other startup tasks."""
+    from shorts_generator.local.ollama_api import status
+    report = await asyncio.to_thread(status, 1.5)
+    state = "ready" if report["running"] and report["model_installed"] else "unavailable"
+    print(f"[ollama] startup: {state}; model={report['model']}; "
+          f"detail={report.get('error', '')}", flush=True)
+
+
+@app.get("/api/ollama/status")
+async def get_ollama_status() -> dict:
+    """Local Ollama reachability and selected model; no token/key required."""
+    from shorts_generator.local.ollama_api import status
+    return await asyncio.to_thread(status, 2.0)
+
+
+@app.on_event("startup")
 async def _check_views() -> None:
     """Read how the channel's Shorts did, when the last look is stale.
 
@@ -245,12 +262,14 @@ async def get_settings() -> dict:
         "has_key": user_config.has_llm_key(),
         "provider": provider,
         "model": current_model(provider),
-        "source": "environment" if from_env else "settings file",
+        "source": ("local Ollama (no API key)" if provider == "ollama"
+                   else "environment" if from_env else "settings file"),
         "config_path": str(user_config.config_path()),
         "ffmpeg": shutil.which("ffmpeg") is not None,
         # Which providers are already set up, so the UI can offer a switch
         # rather than asking for a key that is on disk already.
         "keys": {
+            "ollama": True,  # can be selected without an API key
             "gemini": bool(user_config.get("GEMINI_API_KEY")),
             "groq": bool(user_config.get("GROQ_API_KEY")),
             "openrouter": bool(user_config.get("OPENROUTER_API_KEY")),
@@ -273,6 +292,10 @@ async def get_settings() -> dict:
         "gemini_models": _gemini_model_options(),
         "groq_models": GROQ_MODEL_OPTIONS,
         "openrouter_models": OPENROUTER_MODEL_OPTIONS,
+        "ollama_models": [
+            {"value": "qwen3:1.7b", "note": "recommended for 4GB NVIDIA GPU"},
+            {"value": "qwen3:4b", "note": "more detailed, may offload to CPU"},
+        ],
         "model_pinned": bool(os.getenv(f"{provider.upper()}_MODEL", "").strip()),
         # Spare Gemini keys, counted rather than shown: a key is a secret.
         "gemini_spare_keys": max(0, len(gemini_keys()) - 1),
@@ -324,10 +347,11 @@ async def set_settings(req: SettingsRequest) -> dict:
     # the "gemini or else openai" shape silently files Groq's key under
     # OpenAI's name, which is the kind of bug that only shows up as a
     # confusing auth failure much later.
-    prefixes = {"gemini": "GEMINI", "openai": "OPENAI", "groq": "GROQ",
+    prefixes = {"ollama": "OLLAMA", "gemini": "GEMINI",
+                "openai": "OPENAI", "groq": "GROQ",
                 "openrouter": "OPENROUTER"}
     if provider not in prefixes:
-        raise HTTPException(400, "Provider must be 'gemini', 'groq', 'openrouter' or 'openai'.")
+        raise HTTPException(400, "Unknown AI provider.")
     prefix = prefixes[provider]
 
     key = (req.api_key or "").strip()
@@ -335,11 +359,19 @@ async def set_settings(req: SettingsRequest) -> dict:
     # Switching to a provider whose key is already stored must not demand the
     # key again — retyping a secret you already saved is not a security step,
     # it is just a reason to keep the wrong provider selected.
-    if not key and not user_config.get(key_name):
+    if provider != "ollama" and not key and not user_config.get(key_name):
         raise HTTPException(400, "Paste an API key first.")
 
+    if provider == "ollama":
+        from shorts_generator.local.ollama_api import status
+        report = await asyncio.to_thread(status, 2.0)
+        model = (req.model or user_config.get("OLLAMA_MODEL", "qwen3:1.7b")).strip()
+        if not report["running"]:
+            raise HTTPException(409, "Ollama is not running. Open Ollama first, then retry.")
+        if model not in report["models"]:
+            raise HTTPException(409, f"Ollama model {model} not installed. Run: ollama pull {model}")
     values = {} if req.as_fallback else {"LLM_PROVIDER": provider}
-    if key:
+    if key and provider != "ollama":
         values[key_name] = key
     if req.model:
         model = req.model.strip()

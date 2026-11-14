@@ -269,6 +269,7 @@ async function checkSetup() {
     drawPexels();
     providerPinned = !!d.provider_pinned;
     drawModels(d);
+    toggleLocalKeyInputs();
     if (d.daily_limits) $("capOpenai").value = d.daily_limits.openai || "";
     drawSwitcher(d.provider);
     $("setInfo").innerHTML = `
@@ -281,6 +282,27 @@ async function checkSetup() {
     }
   } catch (_) { /* an offline settings check is not worth blocking startup */ }
 }
+
+// Local Ollama availability is checked on EVERY ClipMint launch.
+async function checkOllama() {
+  const bar = $("ollamaStatusBar"), detail = $("ollamaSettingsStatus");
+  if (bar) bar.textContent = "Ollama: Checking local AI...";
+  try {
+    const s = await api("/api/ollama/status");
+    const msg = !s.running ? "Ollama not running — open Ollama, then retry"
+      : !s.model_installed ? `Ollama online; missing ${s.model} — run: ollama pull ${s.model}`
+      : `Ollama ready — ${s.model} installed`;
+    if (bar) bar.textContent = msg;
+    if (detail) detail.textContent = msg;
+    return s;
+  } catch (e) {
+    const msg = `Ollama status unavailable: ${e.message || e}`;
+    if (bar) bar.textContent = msg;
+    if (detail) detail.textContent = msg;
+    return null;
+  }
+}
+$("ollamaRetry").onclick = checkOllama;
 
 // ---------------------------------------------------------------- profiles
 //
@@ -436,17 +458,21 @@ function drawModels(d) {
   // control entirely, as this used to, left no way to choose one at all.
   // OpenRouter's are written notes too, and it also takes any model ID typed
   // in, since its catalogue is hundreds long and changes every month.
-  const noted = d.provider === "groq" || d.provider === "openrouter";
-  const models = { gemini: d.gemini_models, groq: d.groq_models,
+  const noted = d.provider === "groq" || d.provider === "openrouter" || d.provider === "ollama";
+  const models = { ollama: d.ollama_models, gemini: d.gemini_models, groq: d.groq_models,
                    openrouter: d.openrouter_models }[d.provider] || [];
   drawSpares(d);
-  $("modelOtherFld").hidden = d.provider !== "openrouter" || !!d.model_pinned;
+  $("modelOtherFld").hidden = !["openrouter", "ollama"].includes(d.provider) || !!d.model_pinned;
+$("modelOtherFld").querySelector("span").textContent = d.provider === "ollama"
+  ? "Or type another installed Ollama model name"
+  : "Or any model ID from openrouter.ai/models";
   if (!models.length) {
     fld.hidden = true; hint.textContent = ""; return;
   }
 
   fld.hidden = false;
   $("modelLabel").textContent = I18N.t({
+    ollama: "Ollama local model (no daily cloud limit)",
     gemini: "Gemini model — free requests per day differ a lot",
     groq: "Groq model",
     openrouter: "OpenRouter model",
@@ -470,6 +496,8 @@ function drawModels(d) {
   }
   sel.disabled = false;
   hint.textContent = {
+    ollama: "Runs locally on your PC. Qwen3 1.7B fits best on GTX 1650 4GB. "
+      + "Install a model with ollama pull <name> before selecting it.",
     groq: "Groq's free tier is the same for every model here — 30 a minute, 1000 a "
       + "day, 8k tokens a minute — so this is a straight quality-for-speed "
       + "trade, not an allowance one.",
@@ -485,7 +513,7 @@ $("modelOtherSave").onclick = () => {
   const model = $("modelOther").value.trim();
   if (!model) return;
   $("modelOther").value = "";
-  saveModel(model, "openrouter");
+  saveModel(model, $("setProvider2").value === "ollama" ? "ollama" : "openrouter");
 };
 
 // Spare Gemini keys. Never shown back -- only how many there are -- so saving
@@ -530,6 +558,7 @@ async function saveModel(model, provider) {
       provider: provider || "gemini", model, as_fallback: true,
     }));
     await checkSetup();
+    checkOllama();
     refreshUsage();
     toast(`Now using ${model}.`);
   } catch (e) {
@@ -543,12 +572,12 @@ async function saveModel(model, provider) {
 let keysOnFile = {};
 let providerPinned = false;
 
-const PROVIDER_NAMES = { gemini: "Gemini", groq: "Groq", openrouter: "OpenRouter", openai: "OpenAI" };
+const PROVIDER_NAMES = { ollama: "Ollama", gemini: "Gemini", groq: "Groq", openrouter: "OpenRouter", openai: "OpenAI" };
 
 function drawSwitcher(active) {
   // The first other provider that already has a key, in the order the
   // fallback ladder tries them.
-  const other = ["gemini", "groq", "openrouter", "openai"]
+  const other = ["ollama", "gemini", "groq", "openrouter", "openai"]
     .find((p) => p !== active && keysOnFile[p]);
   const label = PROVIDER_NAMES[other] || "";
   const el = $("switcher");
@@ -578,6 +607,7 @@ async function switchProvider(provider) {
     // No api_key: the server falls back to the stored one for this provider.
     await api("/api/settings", json("POST", { provider }));
     await checkSetup();
+    checkOllama();
     refreshUsage();
     toast(`Now using ${PROVIDER_NAMES[provider] || provider}.`);
   } catch (e) {
@@ -681,6 +711,7 @@ async function refreshUsage() {
 // Groq users to OpenAI's signup page, which is a dead end they have to work
 // out for themselves.
 const KEY_LINKS = {
+  ollama: ["Ollama local install guide →", "https://ollama.com/download"],
   gemini: ["Get a free Gemini key →", "https://aistudio.google.com/apikey"],
   groq:   ["Get a free Groq key →",   "https://console.groq.com/keys"],
   openrouter: ["Get an OpenRouter key →", "https://openrouter.ai/keys"],
@@ -692,11 +723,27 @@ function keyLinkFor(provider) {
   $("keyLink").textContent = label;
   $("keyLink").href = href;
 }
-$("setProvider").onchange = () => keyLinkFor($("setProvider").value);
+function toggleLocalKeyInputs() {
+  for (const [select, key, button] of [
+    ["setProvider", "setKey", "setSave"],
+    ["setProvider2", "setKey2", "setSave2"],
+  ]) {
+    const local = $(select).value === "ollama";
+    $(key).closest("label").hidden = local;
+    $(button).textContent = local ? "Use Ollama" : (select === "setProvider" ? "Save and continue" : "Save key");
+  }
+}
+$("setProvider").onchange = () => {
+  keyLinkFor($("setProvider").value);
+  toggleLocalKeyInputs();
+};
+$("setProvider2").onchange = toggleLocalKeyInputs;
 
 async function saveKey(providerEl, keyEl, btn, msgEl, onDone) {
-  const key = keyEl.value.trim();
-  if (!key) { msgEl.innerHTML = `<div class="err">Paste a key first.</div>`; return; }
+  const key = providerEl.value === "ollama" ? "" : keyEl.value.trim();
+  if (!key && providerEl.value !== "ollama") {
+    msgEl.innerHTML = `<div class="err">Paste a key first.</div>`; return;
+  }
   const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = "Saving…";
@@ -704,7 +751,8 @@ async function saveKey(providerEl, keyEl, btn, msgEl, onDone) {
     await api("/api/settings", json("POST", { provider: providerEl.value, api_key: key }));
     msgEl.innerHTML = `<div class="ok-box">Saved. You're ready to go.</div>`;
     keyEl.value = "";
-    checkSetup();
+    await checkSetup();
+    checkOllama();
     if (onDone) setTimeout(onDone, 1100);
   } catch (e) {
     msgEl.innerHTML = `<div class="err">${esc(e.message)}</div>`;
@@ -4740,6 +4788,7 @@ $("pMini").onclick = () => {
 // ---------------------------------------------------------------- boot
 
 keyLinkFor($("setProvider").value);
+checkOllama();  // every ClipMint open: local API + installed model
 loadProfiles();
 checkSetup();
 refreshUsage();
