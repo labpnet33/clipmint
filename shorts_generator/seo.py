@@ -1238,6 +1238,9 @@ def apply_edit(existing: Optional[Dict], edit: Dict) -> Dict:
         if len(title) > TITLE_LIMIT:
             raise ValueError(f"Titles have to be {TITLE_LIMIT} characters or fewer "
                              f"— that one is {len(title)}.")
+        # Keep human-reviewed fallback titles eligible for future uploads.
+        if title != str(out.get("title") or "").strip():
+            out["title_reviewed"] = True
         out["title"] = title
 
     if "description" in edit:

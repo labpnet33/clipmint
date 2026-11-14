@@ -1115,8 +1115,19 @@ function renderUploadBox() {
 // first spoken line because the model never wrote one. Those went to YouTube
 // as "Holy shit | Dying Light" and reached nobody, so they are not uploaded
 // without a person having changed them.
+function reviewedTitle(c) {
+  const seo = c && c.seo;
+  if (!seo) return false;
+  if (seo.title_reviewed === true) return true;
+  // Backwards compatibility: older manual edits did not set title_reviewed.
+  const original = Array.isArray(seo.title_options) && seo.title_options[0];
+  return !!(seo.edited && original &&
+            (seo.title || "").trim() !== (original.title || "").trim());
+}
+
 function unwrittenTitle(c, title) {
   return !!(c && c.seo && c.seo.generated === false
+            && !reviewedTitle(c)
             && (title || "").trim() === (c.seo.title || "").trim());
 }
 
@@ -1299,7 +1310,7 @@ async function openBulk(runId) {
       description: (c.seo && c.seo.description) || "",
       tags: ((c.seo && c.seo.tags) || []).join(", "),
       hasSeo: !!c.seo, done: c.youtube || null, rank: c.rank || c.index || idx + 1,
-      unwritten: !!(c.seo && c.seo.generated === false), clip: c,
+      unwritten: !!(c.seo && c.seo.generated === false && !reviewedTitle(c)), clip: c,
       url: c.url,
     })),
   };
